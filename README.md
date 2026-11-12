@@ -23,7 +23,21 @@ Sistema de monitoramento ambiental e de ocupação para salas de escritório uti
 
 ## Estrutura do Repositório
 
-A pasta [`modularizacao/`](./modularizacao) contém os módulos base utilizados no firmware:
+### Firmwares Integrados (Prototipagem Final)
+
+Na raiz do repositório encontram-se os códigos completos e integrados de cada nó:
+
+- [`esp-externo.cpp`](./esp-externo.cpp): Firmware do nó externo. Realiza leituras periódicas do sensor DHT11/DHT22 (pino 19), transmite pacotes com dados meteorológicos via LoRa (915 MHz) e exibe o status no display OLED onboard da placa Heltec ESP32.
+- [`esp-interno.cpp`](./esp-interno.cpp): Firmware do nó interno. Realiza:
+  - Controle de ocupação por crachá RFID RC522 via SPI com **vetor dinâmico** (`std::vector<String>`), gerenciando entradas e saídas de pessoas na sala;
+  - Medição de temperatura/umidade interna com sensor DHT (pino 19);
+  - Recepção contínua da temperatura externa transmitida via rádio LoRa (915 MHz);
+  - Cálculo inteligente da **temperatura ideal para o ar-condicionado** considerando carga térmica humana, temperatura externa e padrões de ergonomia (NR-17);
+  - Exibição de todas as informações em tempo real no display OLED Heltec (128x64) e Monitor Serial.
+
+### Módulos Separados (Base)
+
+A pasta [`modularizacao/`](./modularizacao) contém os módulos base utilizados individualmente nos testes de bancada:
 
 - [`comunicacao-lora-transmissor.cpp`](./modularizacao/comunicacao-lora-transmissor.cpp): Envio de pacotes via LoRa (915 MHz) na placa Heltec ESP32.
 - [`comunicacao-lora-receptor.cpp`](./modularizacao/comunicacao-lora-receptor.cpp): Recepção de pacotes via LoRa (915 MHz).
