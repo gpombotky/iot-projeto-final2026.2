@@ -18,8 +18,17 @@
  *      * Temperatura externa (carga térmica ambiental);
  *      * Temperatura interna atual;
  *      * Parâmetros de conforto térmico (NR-17 / ASHRAE 55).
- * 5. Exibição consolidada no display OLED onboard da Heltec (SSD1306).
- * 6. Logs e relatórios periódicos no Monitor Serial (115200 bps).
+ * 5. Comunicação MQTT via biblioteca PubSubClient (knolleary/pubsubclient):
+ *    - Conexão e reconexão WiFi e MQTT de forma 100% não bloqueante (sem travar RFID/LoRa);
+ *    - Publicação em tópicos individuais:
+ *      * sala/pessoas (número de pessoas na sala)
+ *      * sala/temperatura_indicada (temperatura recomendada para o ar-condicionado)
+ *      * sala/temperatura_interna (temperatura medida na sala)
+ *      * sala/temperatura_externa (temperatura externa recebida via LoRa)
+ *    - Publicação consolidada em formato JSON no tópico:
+ *      * sala/telemetria (ideal para integração direta com dashboards Node-RED)
+ * 6. Exibição consolidada no display OLED onboard da Heltec (SSD1306) com status WiFi/MQTT.
+ * 7. Logs e relatórios periódicos no Monitor Serial (115200 bps).
  * ============================================================================
  */
 
@@ -27,12 +36,45 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <vector>
+#include <WiFi.h>
+#include <PubSubClient.h>
 #include "LoRaWan_APP.h"
 #include <MFRC522.h>
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
 #include "HT_SSD1306Wire.h"
+
+// ---------------------------------------------------------------------------
+// Configurações de Rede WiFi e Broker MQTT (PubSubClient)
+// ---------------------------------------------------------------------------
+// Substitua pelas credenciais da sua rede WiFi
+const char* WIFI_SSID       = "SEU_WIFI_SSID";
+const char* WIFI_PASSWORD   = "SUA_WIFI_SENHA";
+
+// Configurações do Broker MQTT (ex.: HiveMQ público, Mosquitto local ou Node-RED)
+const char* MQTT_BROKER     = "broker.hivemq.com"; 
+const int   MQTT_PORT       = 1883;
+const char* MQTT_USER       = "";                  // Usuário (opcional, deixe "" se não usar)
+const char* MQTT_PASSWORD   = "";                  // Senha (opcional, deixe "" se não usar)
+const char* MQTT_CLIENT_PREFIX = "ESP32_Heltec_Sala";
+
+// Tópicos MQTT para publicação das variáveis solicitadas
+#define TOPICO_PESSOAS           "sala/pessoas"
+#define TOPICO_TEMP_INDICADA     "sala/temperatura_indicada"
+#define TOPICO_TEMP_INTERNA      "sala/temperatura_interna"
+#define TOPICO_TEMP_EXTERNA      "sala/temperatura_externa"
+#define TOPICO_TELEMETRIA_JSON   "sala/telemetria"
+
+// Instâncias de rede WiFi e cliente MQTT
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// Controle de tempo para reconexões e publicações MQTT não bloqueantes
+unsigned long ultimaTentativaWiFi = 0;
+unsigned long ultimaTentativaMQTT = 0;
+unsigned long ultimaPublicacaoMQTT = 0;
+const unsigned long INTERVALO_PUBLICACAO_MQTT = 5000; // Publica a cada 5 segundos se conectado
 
 // ---------------------------------------------------------------------------
 // Pinos do Módulo RFID RC522 (Interface SPI)
@@ -109,6 +151,10 @@ float calcularTemperaturaIdeal(float tInterna, float tExterna, int pessoas);
 void atualizarDisplay();
 void imprimirStatusPeriodico();
 
+void inicializarWiFi();
+void gerenciarConexaoWiFiEMqtt();
+void publicarDadosMQTT();
+
 // ---------------------------------------------------------------------------
 // Callback de Recepção LoRa
 // ---------------------------------------------------------------------------
@@ -156,8 +202,9 @@ void processarPacoteLoRa() {
     }
   }
 
-  // Recalcula e atualiza display com o novo dado externo
+  // Recalcula, atualiza display e publica dados no broker MQTT
   atualizarDisplay();
+  publicarDadosMQTT();
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +279,9 @@ void processarRFID() {
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
 
-  // Atualiza imediatamente o display com a nova contagem de pessoas
+  // Atualiza imediatamente o display e publica no MQTT com a nova contagem de pessoas
   atualizarDisplay();
+  publicarDadosMQTT();
 }
 
 // ---------------------------------------------------------------------------
@@ -312,15 +360,152 @@ float calcularTemperaturaIdeal(float tInterna, float tExterna, int pessoas) {
 }
 
 // ---------------------------------------------------------------------------
+// Gerenciamento Não Bloqueante de WiFi e MQTT (PubSubClient)
+// ---------------------------------------------------------------------------
+void inicializarWiFi() {
+  Serial.print("[WiFi] Conectando a rede: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  // Aguarda até 3 segundos pela conexão inicial para não bloquear setup caso sem sinal
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - inicio < 3000)) {
+    delay(200);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Conectado! IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\n[WiFi] Conexao inicial em andamento em segundo plano...");
+  }
+
+  // Configura servidor do broker MQTT
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+}
+
+void gerenciarConexaoWiFiEMqtt() {
+  // 1. Manutenção do WiFi (não bloqueante)
+  if (WiFi.status() != WL_CONNECTED) {
+    unsigned long agora = millis();
+    if (agora - ultimaTentativaWiFi > 10000) {
+      ultimaTentativaWiFi = agora;
+      Serial.println("[WiFi] Tentando reconectar ao WiFi...");
+      WiFi.disconnect();
+      WiFi.reconnect();
+    }
+    return; // Se não tem WiFi, não tenta MQTT ainda
+  }
+
+  // 2. Manutenção do MQTT (não bloqueante)
+  if (!mqttClient.connected()) {
+    unsigned long agora = millis();
+    if (agora - ultimaTentativaMQTT > 5000) {
+      ultimaTentativaMQTT = agora;
+      Serial.print("[MQTT] Tentando conectar ao broker MQTT: ");
+      Serial.print(MQTT_BROKER);
+      Serial.print("...");
+
+      // Cria um Client ID único com base no MAC para evitar conflito de conexões
+      String clientId = String(MQTT_CLIENT_PREFIX) + "_" + String(random(0xffff), HEX);
+
+      bool conectado = false;
+      if (strlen(MQTT_USER) > 0) {
+        conectado = mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD);
+      } else {
+        conectado = mqttClient.connect(clientId.c_str());
+      }
+
+      if (conectado) {
+        Serial.println(" Conectado com sucesso!");
+        // Publica imediatamente após reconexão para atualizar o broker/Node-RED
+        publicarDadosMQTT();
+      } else {
+        Serial.printf(" Falha (rc=%d). Nova tentativa em 5 segundos.\n", mqttClient.state());
+      }
+    }
+  } else {
+    // Processa pacotes de entrada e mantém o keep-alive do MQTT ativo
+    mqttClient.loop();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Publicação dos Dados no Broker MQTT (PubSubClient)
+// ---------------------------------------------------------------------------
+void publicarDadosMQTT() {
+  if (!mqttClient.connected()) {
+    return; // Não publica se não estiver conectado ao broker
+  }
+
+  int pessoas = (int)salaOcupantes.size();
+  float tempIndicada = calcularTemperaturaIdeal(tempInterna, tempExterna, pessoas);
+
+  // 1. Publicação do número de pessoas na sala
+  char bufPessoas[12];
+  snprintf(bufPessoas, sizeof(bufPessoas), "%d", pessoas);
+  mqttClient.publish(TOPICO_PESSOAS, bufPessoas, true);
+
+  // 2. Publicação da temperatura indicada para o ar-condicionado
+  char bufTempIndicada[16];
+  snprintf(bufTempIndicada, sizeof(bufTempIndicada), "%.1f", tempIndicada);
+  mqttClient.publish(TOPICO_TEMP_INDICADA, bufTempIndicada, true);
+
+  // 3. Publicação da temperatura interna
+  char bufTempInterna[16];
+  if (tempInterna > -50.0) {
+    snprintf(bufTempInterna, sizeof(bufTempInterna), "%.1f", tempInterna);
+  } else {
+    snprintf(bufTempInterna, sizeof(bufTempInterna), "null");
+  }
+  mqttClient.publish(TOPICO_TEMP_INTERNA, bufTempInterna, true);
+
+  // 4. Publicação da temperatura externa
+  char bufTempExterna[16];
+  if (tempExternaRecebida) {
+    snprintf(bufTempExterna, sizeof(bufTempExterna), "%.1f", tempExterna);
+  } else {
+    snprintf(bufTempExterna, sizeof(bufTempExterna), "null");
+  }
+  mqttClient.publish(TOPICO_TEMP_EXTERNA, bufTempExterna, true);
+
+  // 5. Publicação consolidada em JSON (ideal para dashboards no Node-RED)
+  char payloadJson[192];
+  snprintf(payloadJson, sizeof(payloadJson),
+           "{\"pessoas\":%d,\"temperatura_indicada\":%.1f,\"temperatura_interna\":%.1f,\"temperatura_externa\":%.1f}",
+           pessoas,
+           tempIndicada,
+           (tempInterna > -50.0 ? tempInterna : 0.0),
+           (tempExternaRecebida ? tempExterna : 0.0));
+  mqttClient.publish(TOPICO_TELEMETRIA_JSON, payloadJson, true);
+
+  Serial.println("\n[MQTT] Dados publicados nos topicos:");
+  Serial.printf("  - %s: %s\n", TOPICO_PESSOAS, bufPessoas);
+  Serial.printf("  - %s: %s *C\n", TOPICO_TEMP_INDICADA, bufTempIndicada);
+  Serial.printf("  - %s: %s *C\n", TOPICO_TEMP_INTERNA, bufTempInterna);
+  Serial.printf("  - %s: %s *C\n", TOPICO_TEMP_EXTERNA, bufTempExterna);
+  Serial.printf("  - %s: %s\n", TOPICO_TELEMETRIA_JSON, payloadJson);
+  Serial.println("----------------------------------------");
+}
+
+// ---------------------------------------------------------------------------
 // Atualização Visual do Display OLED Heltec
 // ---------------------------------------------------------------------------
 void atualizarDisplay() {
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_LEFT);
 
-  // Linha 0: Cabeçalho
+  // Linha 0: Cabeçalho com indicador de conectividade MQTT
   display.setFont(ArialMT_Plain_10);
-  display.drawString(0, 0, "=== MONITOR DE SALA ===");
+  if (mqttClient.connected()) {
+    display.drawString(0, 0, "SALA IoT  [MQTT: OK]");
+  } else if (WiFi.status() == WL_CONNECTED) {
+    display.drawString(0, 0, "SALA IoT  [WiFi: OK]");
+  } else {
+    display.drawString(0, 0, "=== MONITOR DE SALA ===");
+  }
 
   char buffer[32];
 
@@ -383,6 +568,9 @@ void imprimirStatusPeriodico() {
   }
 
   Serial.printf("[STATUS] >> AR IDEAL:     %.1f *C <<\n", setpoint);
+  Serial.printf("[STATUS] WiFi: %s | MQTT: %s\n", 
+                (WiFi.status() == WL_CONNECTED ? "CONECTADO" : "DESCONECTADO"),
+                (mqttClient.connected() ? "CONECTADO" : "DESCONECTADO"));
   Serial.println("=========================================");
 }
 
@@ -410,9 +598,9 @@ void setup() {
   display.setFont(ArialMT_Plain_10);
   display.clear();
   display.drawString(0, 0, "Iniciando Nó Interno...");
-  display.drawString(0, 16, "RFID RC522: SPI (3,4,5,6,7)");
+  display.drawString(0, 16, "RFID: SPI (3,4,5,6,7)");
   display.drawString(0, 28, "DHT Interno: Pino 19");
-  display.drawString(0, 40, "LoRa RX: 915 MHz");
+  display.drawString(0, 40, "LoRa: 915 MHz | MQTT");
   display.display();
 
   // Reset físico do RC522 para garantir inicialização limpa
@@ -445,6 +633,9 @@ void setup() {
 
   Serial.println("[LoRa] Receptor LoRa configurado a 915 MHz.");
 
+  // Inicialização não bloqueante da conexão WiFi e MQTT
+  inicializarWiFi();
+
   atualizarDisplay();
 }
 
@@ -470,6 +661,15 @@ void loop() {
   // 5. Amostragem periódica da temperatura e umidade interna da sala
   lerSensorInterno();
 
-  // 6. Impressão periódica do status consolidado no Monitor Serial
+  // 6. Gerenciamento de conexões de rede WiFi e broker MQTT (PubSubClient)
+  gerenciarConexaoWiFiEMqtt();
+
+  // 7. Publicação periódica no broker MQTT
+  if (millis() - ultimaPublicacaoMQTT >= INTERVALO_PUBLICACAO_MQTT) {
+    ultimaPublicacaoMQTT = millis();
+    publicarDadosMQTT();
+  }
+
+  // 8. Impressão periódica do status consolidado no Monitor Serial
   imprimirStatusPeriodico();
 }

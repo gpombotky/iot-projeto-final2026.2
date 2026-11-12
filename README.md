@@ -33,6 +33,12 @@ Na raiz do repositório encontram-se os códigos completos e integrados de cada 
   - Medição de temperatura/umidade interna com sensor DHT (pino 19);
   - Recepção contínua da temperatura externa transmitida via rádio LoRa (915 MHz);
   - Cálculo inteligente da **temperatura ideal para o ar-condicionado** considerando carga térmica humana, temperatura externa e padrões de ergonomia (NR-17);
+  - Comunicação **MQTT via PubSubClient** publicando:
+    * `sala/pessoas`: Contagem atual de ocupantes da sala;
+    * `sala/temperatura_indicada`: Temperatura recomendada para o ar-condicionado;
+    * `sala/temperatura_interna`: Temperatura medida no ambiente interno;
+    * `sala/temperatura_externa`: Temperatura do nó externo recebida por LoRa;
+    * `sala/telemetria`: Payload consolidado em formato JSON para dashboard Node-RED.
   - Exibição de todas as informações em tempo real no display OLED Heltec (128x64) e Monitor Serial.
 
 ### Módulos Separados (Base)
