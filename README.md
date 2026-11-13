@@ -27,19 +27,27 @@ Sistema de monitoramento ambiental e de ocupação para salas de escritório uti
 
 Na raiz do repositório encontram-se os códigos completos e integrados de cada nó:
 
-- [`esp-externo.cpp`](./esp-externo.cpp): Firmware do nó externo. Realiza leituras periódicas do sensor DHT11/DHT22 (pino 19), transmite pacotes com dados meteorológicos via LoRa (915 MHz) e exibe o status no display OLED onboard da placa Heltec ESP32.
+- [`esp-externo.cpp`](./esp-externo.cpp): Firmware do nó externo. Realiza leituras periódicas do sensor DHT11/DHT22 (pino 19), transmite pacotes contínuos com dados meteorológicos via LoRa (915 MHz) e exibe o status no display OLED onboard da placa Heltec ESP32.
 - [`esp-interno.cpp`](./esp-interno.cpp): Firmware do nó interno. Realiza:
-  - Controle de ocupação por crachá RFID RC522 via SPI com **vetor dinâmico** (`std::vector<String>`), gerenciando entradas e saídas de pessoas na sala;
+  - Arquitetura **Dual-SPI por Hardware** (ESP32-S3): controlador `HSPI` exclusivo para o RFID RC522 (pinos 6, 4, 5, 7) via biblioteca `MFRC522v2`, permitindo coexistência perfeita e sem colisões com o rádio LoRa SX1262 (que utiliza o `FSPI` nativo da Heltec);
+  - Controle de ocupação por crachá RFID RC522 (idêntico à lógica de `modularizacao/cracha-rfid.cpp`), gerenciando entradas e saídas de pessoas na sala;
   - Medição de temperatura/umidade interna com sensor DHT (pino 19);
   - Recepção contínua da temperatura externa transmitida via rádio LoRa (915 MHz);
   - Cálculo inteligente da **temperatura ideal para o ar-condicionado** considerando carga térmica humana, temperatura externa e padrões de ergonomia (NR-17);
-  - Comunicação **MQTT via PubSubClient** publicando:
+  - Comunicação **MQTT via PubSubClient** (com chave configurável `#define USAR_WIFI_MQTT false` para testes em bancada sem bloqueio) publicando:
     * `sala/pessoas`: Contagem atual de ocupantes da sala;
     * `sala/temperatura_indicada`: Temperatura recomendada para o ar-condicionado;
     * `sala/temperatura_interna`: Temperatura medida no ambiente interno;
     * `sala/temperatura_externa`: Temperatura do nó externo recebida por LoRa;
     * `sala/telemetria`: Payload consolidado em formato JSON para dashboard Node-RED.
   - Exibição de todas as informações em tempo real no display OLED Heltec (128x64) e Monitor Serial.
+
+### Bibliotecas Necessárias no Arduino IDE
+
+1. **Heltec ESP32 Dev-Boards** (Board package oficial Heltec)
+2. **MFRC522v2** (por *GithubCommunity / miguelbalboa* — instale a versão v2 pelo Gerenciador de Bibliotecas)
+3. **DHT sensor library** (por *Adafruit*) + **Adafruit Unified Sensor**
+4. **PubSubClient** (por *Nick O'Leary*)
 
 ### Módulos Separados (Base)
 
