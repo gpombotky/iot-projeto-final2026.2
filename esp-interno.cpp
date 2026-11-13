@@ -5,6 +5,10 @@
  * Arquivo: esp-interno.cpp
  * Dispositivo: Heltec WiFi LoRa 32 (Nó Interno Receptor, RFID, DHT & Climatização)
  * 
+ * Arquitetura Dual-SPI por Hardware (ESP32-S3):
+ * - Barramento SPI 1 (FSPI / SPI Global): Exclusivo para o rádio LoRa SX1262 da Heltec (pinos internos 9, 10, 11, 8).
+ * - Barramento SPI 2 (HSPI / rfidSPI): Exclusivo para o RFID RC522 (pinos externos 6, 4, 5, 7) via biblioteca MFRC522v2.
+ * 
  * Baseado ESTRITAMENTE em:
  * - modularizacao/comunicacao-lora-receptor.cpp
  * - modularizacao/cracha-rfid.cpp
@@ -15,7 +19,9 @@
 #include "LoRaWan_APP.h"
 #include "Arduino.h"
 #include <SPI.h>
-#include <MFRC522.h>
+#include <MFRC522v2.h>
+#include <MFRC522DriverSPI.h>
+#include <MFRC522DriverPinSimple.h>
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
@@ -35,7 +41,30 @@ PubSubClient mqttClient(espClient);
 #endif
 
 // ---------------------------------------------------------------------------
-// 1. Configurações LoRa Receptor (idênticas a comunicacao-lora-receptor.cpp)
+// 1. Configurações RFID RC522 em Barramento Hardware SPI Dedicado (HSPI)
+// ---------------------------------------------------------------------------
+#define SS_PIN   7
+#define RST_PIN  3
+#define SCK_PIN  6
+#define MISO_PIN 4
+#define MOSI_PIN 5
+
+// Instância de controlador SPI em hardware exclusiva para o leitor RFID
+SPIClass rfidSPI(HSPI);
+
+MFRC522DriverPinSimple ss_pin(SS_PIN);
+MFRC522DriverSPI driver{ss_pin, rfidSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0)};
+MFRC522 rfid{driver};
+
+// Guarda até 20 crachás (exatamente como em cracha-rfid.cpp)
+byte sala[20][10];
+byte tamanhoUidSala[20];
+int qtdPessoas = 0;
+unsigned long ultimoAviso = 0;
+unsigned long ultimaChecagemRFID = 0;
+
+// ---------------------------------------------------------------------------
+// 2. Configurações LoRa Receptor (idênticas a comunicacao-lora-receptor.cpp)
 // ---------------------------------------------------------------------------
 #define RF_FREQUENCY                                915000000 // Hz
 #define TX_OUTPUT_POWER                             14        // dBm
@@ -57,25 +86,6 @@ int16_t txNumber;
 int16_t rssi, rxSize;
 bool lora_idle = true;
 void OnRxDone( uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr );
-
-// ---------------------------------------------------------------------------
-// 2. Configurações RFID RC522 (idênticas a cracha-rfid.cpp)
-// ---------------------------------------------------------------------------
-#define SS_PIN   7
-#define RST_PIN  3
-#define SCK_PIN  6
-#define MISO_PIN 4
-#define MOSI_PIN 5
-
-// Inicializa o leitor RFID
-MFRC522 rfid(SS_PIN, RST_PIN);
-
-// Guarda ate 20 crachas (exatamente como em cracha-rfid.cpp)
-byte sala[20][10];
-byte tamanhoUidSala[20];
-int qtdPessoas = 0;
-unsigned long ultimoAviso = 0;
-unsigned long ultimaChecagemRFID = 0;
 
 // ---------------------------------------------------------------------------
 // 3. Sensor DHT Interno (idêntico a sensor-temp-umidade.cpp)
@@ -165,12 +175,12 @@ void atualizarDisplayOLED() {
 // ---------------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
-    delay(1500); // Espera o Monitor Serial reconectar apos o upload (como em cracha-rfid.cpp)
+    delay(1500); // Espera o Monitor Serial reconectar após o upload (como em cracha-rfid.cpp)
 
     // 1. Inicializa MCU Heltec (OBRIGATÓRIO ser a primeira chamada)
     Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
 
-    // 2. Inicializa Display OLED integrado
+    // 2. Inicializa Display OLED integrado da Heltec
     #ifdef Vext
     pinMode(Vext, OUTPUT);
     digitalWrite(Vext, LOW); // Liga alimentação do OLED na Heltec
@@ -190,24 +200,19 @@ void setup() {
     digitalWrite(RST_PIN, HIGH);
     delay(50);
 
-    // 4. Inicializa SPI com os pinos escolhidos para o RFID
-    SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+    // 4. Inicializa o barramento SPI dedicado (HSPI) para o RFID nos pinos 6, 4, 5, 7
+    rfidSPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
     rfid.PCD_Init();
     delay(50);
 
     Serial.println("================================");
-    Serial.println("        RFID RC522 INICIADO");
+    Serial.println("        RFID RC522 INICIADO     ");
     Serial.println("================================");
+    Serial.print("Teste do leitor RC522: ");
+    rfid.PCD_DumpVersionToSerial(); // Diagnóstico: 0x91/0x92 = Comunicação OK! (0x00/0xFF = Falha na fiação)
     Serial.println("Aproxime um cartao ou tag...");
 
-    // 5. Restaura os pinos do SPI para o módulo LoRa integrado da Heltec
-    #ifdef SCK
-    SPI.begin(SCK, MISO, MOSI, SS);
-    #else
-    SPI.begin(9, 11, 10, 8); // Pinos padrão Heltec V3
-    #endif
-
-    // 6. Inicializa o rádio LoRa Receptor (idêntico a comunicacao-lora-receptor.cpp)
+    // 5. Inicializa o rádio LoRa Receptor no barramento SPI padrão do sistema (FSPI)
     txNumber = 0;
     rssi = 0;
     RadioEvents.RxDone = OnRxDone;
@@ -220,7 +225,7 @@ void setup() {
 
     Serial.println("LoRa Receptor configurado em 915 MHz.");
 
-    // 7. Inicializa sensor DHT interno
+    // 6. Inicializa sensor DHT interno
     dht.begin();
     Serial.println("DHT interno inicializado no pino 19.");
 
@@ -234,20 +239,11 @@ void setup() {
 }
 
 // ---------------------------------------------------------------------------
-// Rotina de Leitura de RFID (com restauração de SPI para coexistência com LoRa)
+// Rotina de Leitura de RFID (Barramento HSPI Independente)
 // ---------------------------------------------------------------------------
 void processarRFID() {
-    // Comuta o barramento SPI para os pinos do RFID (6, 4, 5, 7)
-    SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
-
-    // Verifica se existe um novo cartao
+    // Verifica se existe um novo cartão no leitor RFID
     if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
-        // Restaura imediatamente para os pinos do LoRa
-        #ifdef SCK
-        SPI.begin(SCK, MISO, MOSI, SS);
-        #else
-        SPI.begin(9, 11, 10, 8);
-        #endif
         return;
     }
 
@@ -266,7 +262,7 @@ void processarRFID() {
     Serial.print("Tipo: ");
     Serial.println(rfid.PICC_GetTypeName(tipo));
 
-    // --- CONTROLE DE ENTRADA E SAIDA DA SALA (cracha-rfid.cpp) ---
+    // --- CONTROLE DE ENTRADA E SAÍDA DA SALA (cracha-rfid.cpp) ---
     int pos = -1;
     for (int i = 0; i < qtdPessoas; i++) {
         if (tamanhoUidSala[i] == rfid.uid.size) {
@@ -325,13 +321,6 @@ void processarRFID() {
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
 
-    // Restaura o barramento SPI para o LoRa da Heltec
-    #ifdef SCK
-    SPI.begin(SCK, MISO, MOSI, SS);
-    #else
-    SPI.begin(9, 11, 10, 8);
-    #endif
-
     atualizarDisplayOLED();
 }
 
@@ -348,7 +337,7 @@ void loop()
     }
     Radio.IrqProcess( );
 
-    // 2. Lógica RFID (amostragem periódica a cada 100ms)
+    // 2. Lógica RFID (amostragem periódica a cada 100ms no barramento HSPI separado)
     if (millis() - ultimaChecagemRFID >= 100) {
         ultimaChecagemRFID = millis();
         processarRFID();
@@ -386,7 +375,6 @@ void loop()
             mqttClient.connect("ESP32_Interno_Sala");
         } else {
             mqttClient.loop();
-            // Publica dados da sala no broker MQTT
             char buf[64];
             sprintf(buf, "%d", qtdPessoas);
             mqttClient.publish("sala/pessoas", buf);
