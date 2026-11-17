@@ -351,6 +351,8 @@ void loop()
         Serial.println(qtdPessoas);
         Serial.printf("[Status Climatizacao] Temp Int: %.1f C | Temp Ext: %.1f C | Ar Ideal: %.1f C\n",
                       tempInterna, tempExterna, calcularTemperaturaIdeal(tempInterna, tempExterna, qtdPessoas));
+        Serial.print("[Diagnostico RFID] ");
+        MFRC522Debug::PCD_DumpVersionToSerial(rfid, Serial);
     }
 
     // 4. Leitura periódica do sensor DHT interno (a cada 2,5 segundos)
@@ -401,8 +403,14 @@ void OnRxDone( uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr )
     Radio.Sleep( );
     Serial.printf("\r\nreceived packet \"%s\" with rssi %d , length %d\r\n", rxpacket, rssi, rxSize);
 
-    // Converte a string de temperatura externa recebida para float
-    float valorRecebido = atof(rxpacket);
+    // Converte a string de temperatura externa recebida para float (suporta "28.20" e "TEMP:28.20;UMID:54.00")
+    float valorRecebido = 0.0;
+    char* ptrTemp = strstr(rxpacket, "TEMP:");
+    if (ptrTemp != NULL) {
+        valorRecebido = atof(ptrTemp + 5);
+    } else {
+        valorRecebido = atof(rxpacket);
+    }
     if (valorRecebido != 0.0 || strcmp(rxpacket, "0.0") == 0 || strcmp(rxpacket, "0.00") == 0) {
         tempExterna = valorRecebido;
         tempExternaRecebida = true;
