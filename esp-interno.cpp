@@ -110,6 +110,9 @@ bool tempExternaRecebida = false;
 float tempInterna = 0.0;
 unsigned long ultimaLeituraDHT = 0;
 unsigned long ultimoUpdateDisplay = 0;
+#if USAR_WIFI_MQTT
+unsigned long ultimaTentativaMQTT = 0;
+#endif
 
 // ---------------------------------------------------------------------------
 // Função: Cálculo da Temperatura Ideal do Ar Condicionado
@@ -170,6 +173,34 @@ void atualizarDisplayOLED() {
 
     display.display();
 }
+
+#if USAR_WIFI_MQTT
+void publicarMQTT() {
+    if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
+        float arIdeal = calcularTemperaturaIdeal(tempInterna, tempExterna, qtdPessoas);
+        char buf[128];
+
+        sprintf(buf, "%d", qtdPessoas);
+        mqttClient.publish("sala/pessoas", buf);
+
+        sprintf(buf, "%.1f", arIdeal);
+        mqttClient.publish("sala/temperatura_indicada", buf);
+
+        sprintf(buf, "%.1f", tempInterna);
+        mqttClient.publish("sala/temperatura_interna", buf);
+
+        sprintf(buf, "%.1f", tempExterna);
+        mqttClient.publish("sala/temperatura_externa", buf);
+
+        snprintf(buf, sizeof(buf),
+                 "{\"pessoas\":%d,\"temp_interna\":%.1f,\"temp_externa\":%.1f,\"temp_indicada\":%.1f}",
+                 qtdPessoas, tempInterna, tempExterna, arIdeal);
+        mqttClient.publish("sala/telemetria", buf);
+
+        Serial.println("[MQTT] Dados publicados nos topicos sala/*");
+    }
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // SETUP
@@ -323,6 +354,9 @@ void processarRFID() {
     rfid.PCD_StopCrypto1();
 
     atualizarDisplayOLED();
+    #if USAR_WIFI_MQTT
+    publicarMQTT();
+    #endif
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +387,9 @@ void loop()
                       tempInterna, tempExterna, calcularTemperaturaIdeal(tempInterna, tempExterna, qtdPessoas));
         Serial.print("[Diagnostico RFID] ");
         MFRC522Debug::PCD_DumpVersionToSerial(rfid, Serial);
+        #if USAR_WIFI_MQTT
+        publicarMQTT();
+        #endif
     }
 
     // 4. Leitura periódica do sensor DHT interno (a cada 2,5 segundos)
@@ -375,18 +412,18 @@ void loop()
     #if USAR_WIFI_MQTT
     if (WiFi.status() == WL_CONNECTED) {
         if (!mqttClient.connected()) {
-            mqttClient.connect("ESP32_Interno_Sala");
+            if (millis() - ultimaTentativaMQTT > 5000) {
+                ultimaTentativaMQTT = millis();
+                Serial.printf("[MQTT] Tentando conectar ao broker %s:%d...\n", MQTT_BROKER, MQTT_PORT);
+                if (mqttClient.connect("ESP32_Interno_Sala")) {
+                    Serial.println("[MQTT] Conectado ao broker com sucesso!");
+                    publicarMQTT();
+                } else {
+                    Serial.printf("[MQTT] Falha na conexao (rc=%d). Tentando novamente em 5s...\n", mqttClient.state());
+                }
+            }
         } else {
             mqttClient.loop();
-            char buf[64];
-            sprintf(buf, "%d", qtdPessoas);
-            mqttClient.publish("sala/pessoas", buf);
-            sprintf(buf, "%.1f", calcularTemperaturaIdeal(tempInterna, tempExterna, qtdPessoas));
-            mqttClient.publish("sala/temperatura_indicada", buf);
-            sprintf(buf, "%.1f", tempInterna);
-            mqttClient.publish("sala/temperatura_interna", buf);
-            sprintf(buf, "%.1f", tempExterna);
-            mqttClient.publish("sala/temperatura_externa", buf);
         }
     }
     #endif
