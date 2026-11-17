@@ -22,6 +22,7 @@
 #include <MFRC522v2.h>
 #include <MFRC522DriverSPI.h>
 #include <MFRC522DriverPinSimple.h>
+#include <MFRC522Debug.h>
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
@@ -209,7 +210,7 @@ void setup() {
     Serial.println("        RFID RC522 INICIADO     ");
     Serial.println("================================");
     Serial.print("Teste do leitor RC522: ");
-    rfid.PCD_DumpVersionToSerial(); // Diagnóstico: 0x91/0x92 = Comunicação OK! (0x00/0xFF = Falha na fiação)
+    MFRC522Debug::PCD_DumpVersionToSerial(rfid, Serial); // Diagnóstico: 0x91/0x92 = Comunicação OK! (0x00/0xFF = Falha na fiação)
     Serial.println("Aproxime um cartao ou tag...");
 
     // 5. Inicializa o rádio LoRa Receptor no barramento SPI padrão do sistema (FSPI)
@@ -260,7 +261,7 @@ void processarRFID() {
 
     MFRC522::PICC_Type tipo = rfid.PICC_GetType(rfid.uid.sak);
     Serial.print("Tipo: ");
-    Serial.println(rfid.PICC_GetTypeName(tipo));
+    Serial.println(MFRC522Debug::PICC_GetTypeName(tipo));
 
     // --- CONTROLE DE ENTRADA E SAÍDA DA SALA (cracha-rfid.cpp) ---
     int pos = -1;
