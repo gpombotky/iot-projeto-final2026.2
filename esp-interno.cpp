@@ -414,8 +414,10 @@ void loop()
         if (!mqttClient.connected()) {
             if (millis() - ultimaTentativaMQTT > 5000) {
                 ultimaTentativaMQTT = millis();
-                Serial.printf("[MQTT] Tentando conectar ao broker %s:%d...\n", MQTT_BROKER, MQTT_PORT);
-                if (mqttClient.connect("ESP32_Interno_Sala")) {
+                String clientId = "ESP32_Sala_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+                Serial.printf("[MQTT] WiFi OK (IP do ESP32: %s) | Conectando ao broker %s:%d (ID: %s)...\n",
+                              WiFi.localIP().toString().c_str(), MQTT_BROKER, MQTT_PORT, clientId.c_str());
+                if (mqttClient.connect(clientId.c_str())) {
                     Serial.println("[MQTT] Conectado ao broker com sucesso!");
                     publicarMQTT();
                 } else {
@@ -425,6 +427,9 @@ void loop()
         } else {
             mqttClient.loop();
         }
+    } else if (millis() - ultimaTentativaMQTT > 5000) {
+        ultimaTentativaMQTT = millis();
+        Serial.printf("[WiFi] Aguardando conexao WiFi em \"%s\" (status=%d)...\n", WIFI_SSID, WiFi.status());
     }
     #endif
 }
