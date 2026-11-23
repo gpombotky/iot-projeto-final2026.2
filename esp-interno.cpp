@@ -1,0 +1,464 @@
+/*
+ * ============================================================================
+ * PROJETO FINAL IoT - MONITORAMENTO INTELIGENTE DE SALAS
+ * ============================================================================
+ * Arquivo: esp-interno.cpp
+ * Dispositivo: Heltec WiFi LoRa 32 (Nó Interno Receptor, RFID, DHT & Climatização)
+ * 
+ * Arquitetura Dual-SPI por Hardware (ESP32-S3):
+ * - Barramento SPI 1 (FSPI / SPI Global): Exclusivo para o rádio LoRa SX1262 da Heltec (pinos internos 9, 10, 11, 8).
+ * - Barramento SPI 2 (HSPI / rfidSPI): Exclusivo para o RFID RC522 (pinos externos 6, 4, 5, 7) via biblioteca MFRC522v2.
+ * 
+ * Baseado ESTRITAMENTE em:
+ * - modularizacao/comunicacao-lora-receptor.cpp
+ * - modularizacao/cracha-rfid.cpp
+ * - modularizacao/sensor-temp-umidade.cpp
+ * ============================================================================
+ */
+
+#include "LoRaWan_APP.h"
+#include "Arduino.h"
+#include <SPI.h>
+#include <MFRC522v2.h>
+#include <MFRC522DriverSPI.h>
+#include <MFRC522DriverPinSimple.h>
+#include <MFRC522Debug.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include "HT_SSD1306Wire.h"
+
+// Opcional: Se for usar WiFi/MQTT com Node-RED, ative a flag abaixo e coloque seus dados
+#define USAR_WIFI_MQTT                              false
+#if USAR_WIFI_MQTT
+#include <WiFi.h>
+#include <PubSubClient.h>
+const char* WIFI_SSID     = "SEU_WIFI_SSID";
+const char* WIFI_PASSWORD = "SUA_WIFI_SENHA";
+const char* MQTT_BROKER   = "broker.hivemq.com";
+const int   MQTT_PORT     = 1883;
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+#endif
+
+// ---------------------------------------------------------------------------
+// 1. Configurações RFID RC522 em Barramento Hardware SPI Dedicado (HSPI)
+// ---------------------------------------------------------------------------
+#define SS_PIN   7
+#define RST_PIN  3
+#define SCK_PIN  6
+#define MISO_PIN 4
+#define MOSI_PIN 5
+
+// Instância de controlador SPI em hardware exclusiva para o leitor RFID
+SPIClass rfidSPI(HSPI);
+
+MFRC522DriverPinSimple ss_pin(SS_PIN);
+MFRC522DriverSPI driver{ss_pin, rfidSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0)};
+MFRC522 rfid{driver};
+
+// Guarda até 20 crachás (exatamente como em cracha-rfid.cpp)
+byte sala[20][10];
+byte tamanhoUidSala[20];
+int qtdPessoas = 0;
+unsigned long ultimoAviso = 0;
+unsigned long ultimaChecagemRFID = 0;
+
+// ---------------------------------------------------------------------------
+// 2. Configurações LoRa Receptor (idênticas a comunicacao-lora-receptor.cpp)
+// ---------------------------------------------------------------------------
+#define RF_FREQUENCY                                915000000 // Hz
+#define TX_OUTPUT_POWER                             14        // dBm
+#define LORA_BANDWIDTH                              0         // [0: 125 kHz]
+#define LORA_SPREADING_FACTOR                       7         // [SF7..SF12]
+#define LORA_CODINGRATE                             1         // [1: 4/5]
+#define LORA_PREAMBLE_LENGTH                        8         // Same for Tx and Rx
+#define LORA_SYMBOL_TIMEOUT                         0         // Symbols
+#define LORA_FIX_LENGTH_PAYLOAD_ON                  false
+#define LORA_IQ_INVERSION_ON                        false
+#define RX_TIMEOUT_VALUE                            1000
+#define BUFFER_SIZE                                 30        // Define the payload size here
+
+char txpacket[BUFFER_SIZE];
+char rxpacket[BUFFER_SIZE];
+
+static RadioEvents_t RadioEvents;
+int16_t txNumber;
+int16_t rssi, rxSize;
+bool lora_idle = true;
+void OnRxDone( uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr );
+
+// ---------------------------------------------------------------------------
+// 3. Sensor DHT Interno (idêntico a sensor-temp-umidade.cpp)
+// ---------------------------------------------------------------------------
+#define DHTTYPE    DHT11
+#define DHTPIN     19
+DHT_Unified dht(DHTPIN, DHTTYPE);
+
+// ---------------------------------------------------------------------------
+// 4. Display OLED Onboard da Heltec
+// ---------------------------------------------------------------------------
+#ifdef SDA_OLED
+static SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED);
+#else
+static SSD1306Wire display(0x3c, 500000, 17, 18, GEOMETRY_128_64, 21);
+#endif
+
+// Variáveis de temperatura
+float tempExterna = 0.0;
+bool tempExternaRecebida = false;
+float tempInterna = 0.0;
+unsigned long ultimaLeituraDHT = 0;
+unsigned long ultimoUpdateDisplay = 0;
+#if USAR_WIFI_MQTT
+unsigned long ultimaTentativaMQTT = 0;
+#endif
+
+// ---------------------------------------------------------------------------
+// Função: Cálculo da Temperatura Ideal do Ar Condicionado
+// ---------------------------------------------------------------------------
+float calcularTemperaturaIdeal(float tInt, float tExt, int pessoas) {
+    if (pessoas == 0) {
+        return 25.0; // Modo economia quando sala vazia
+    }
+    // Base de conforto térmico (NR-17): 23 °C
+    float tIdeal = 23.0;
+
+    // Compensação por ocupação: -0.5 °C por pessoa adicional
+    tIdeal -= (pessoas - 1) * 0.5;
+
+    // Compensação de calor externo recebido via LoRa
+    if (tempExternaRecebida) {
+        if (tExt >= 30.0) tIdeal -= 1.0;
+        else if (tExt < 20.0) tIdeal += 1.0;
+    }
+
+    // Limites operacionais de conforto
+    if (tIdeal < 18.0) tIdeal = 18.0;
+    if (tIdeal > 26.0) tIdeal = 26.0;
+    return tIdeal;
+}
+
+// ---------------------------------------------------------------------------
+// Função: Atualização do Display OLED da Heltec
+// ---------------------------------------------------------------------------
+void atualizarDisplayOLED() {
+    float arIdeal = calcularTemperaturaIdeal(tempInterna, tempExterna, qtdPessoas);
+
+    display.clear();
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(0, 0, "=== MONITOR DE SALA ===");
+
+    char buffer[32];
+    sprintf(buffer, "Pessoas na sala: %d", qtdPessoas);
+    display.drawString(0, 15, buffer);
+
+    if (tempInterna > 0.0) {
+        sprintf(buffer, "Temp Int: %.1f C", tempInterna);
+    } else {
+        sprintf(buffer, "Temp Int: Lendo...");
+    }
+    display.drawString(0, 27, buffer);
+
+    if (tempExternaRecebida) {
+        sprintf(buffer, "Temp Ext: %.1f C (LoRa)", tempExterna);
+    } else {
+        sprintf(buffer, "Temp Ext: Aguardando...");
+    }
+    display.drawString(0, 39, buffer);
+
+    sprintf(buffer, "Ar Ideal: %.1f C", arIdeal);
+    display.drawString(0, 51, buffer);
+
+    display.display();
+}
+
+#if USAR_WIFI_MQTT
+void publicarMQTT() {
+    if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
+        float arIdeal = calcularTemperaturaIdeal(tempInterna, tempExterna, qtdPessoas);
+        char buf[128];
+
+        sprintf(buf, "%d", qtdPessoas);
+        mqttClient.publish("sala/pessoas", buf);
+
+        sprintf(buf, "%.1f", arIdeal);
+        mqttClient.publish("sala/temperatura_indicada", buf);
+
+        sprintf(buf, "%.1f", tempInterna);
+        mqttClient.publish("sala/temperatura_interna", buf);
+
+        sprintf(buf, "%.1f", tempExterna);
+        mqttClient.publish("sala/temperatura_externa", buf);
+
+        snprintf(buf, sizeof(buf),
+                 "{\"pessoas\":%d,\"temp_interna\":%.1f,\"temp_externa\":%.1f,\"temp_indicada\":%.1f}",
+                 qtdPessoas, tempInterna, tempExterna, arIdeal);
+        mqttClient.publish("sala/telemetria", buf);
+
+        Serial.println("[MQTT] Dados publicados nos topicos sala/*");
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// SETUP
+// ---------------------------------------------------------------------------
+void setup() {
+    Serial.begin(115200);
+    delay(1500); // Espera o Monitor Serial reconectar após o upload (como em cracha-rfid.cpp)
+
+    // 1. Inicializa MCU Heltec (OBRIGATÓRIO ser a primeira chamada)
+    Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+
+    // 2. Inicializa Display OLED integrado da Heltec
+    #ifdef Vext
+    pinMode(Vext, OUTPUT);
+    digitalWrite(Vext, LOW); // Liga alimentação do OLED na Heltec
+    delay(50);
+    #endif
+    display.init();
+    display.flipScreenVertically();
+    display.setFont(ArialMT_Plain_10);
+    display.clear();
+    display.drawString(0, 0, "Iniciando ESP Interno...");
+    display.display();
+
+    // 3. Força reset físico no pino RST do RC522 para não travar (de cracha-rfid.cpp)
+    pinMode(RST_PIN, OUTPUT);
+    digitalWrite(RST_PIN, LOW);
+    delay(50);
+    digitalWrite(RST_PIN, HIGH);
+    delay(50);
+
+    // 4. Inicializa o barramento SPI dedicado (HSPI) para o RFID nos pinos 6, 4, 5, 7
+    rfidSPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+    rfid.PCD_Init();
+    delay(50);
+
+    Serial.println("================================");
+    Serial.println("        RFID RC522 INICIADO     ");
+    Serial.println("================================");
+    Serial.print("Teste do leitor RC522: ");
+    MFRC522Debug::PCD_DumpVersionToSerial(rfid, Serial); // Diagnóstico: 0x91/0x92 = Comunicação OK! (0x00/0xFF = Falha na fiação)
+    Serial.println("Aproxime um cartao ou tag...");
+
+    // 5. Inicializa o rádio LoRa Receptor no barramento SPI padrão do sistema (FSPI)
+    txNumber = 0;
+    rssi = 0;
+    RadioEvents.RxDone = OnRxDone;
+    Radio.Init( &RadioEvents );
+    Radio.SetChannel( RF_FREQUENCY );
+    Radio.SetRxConfig( MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR,
+                                   LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH,
+                                   LORA_SYMBOL_TIMEOUT, LORA_FIX_LENGTH_PAYLOAD_ON,
+                                   0, true, 0, 0, LORA_IQ_INVERSION_ON, true );
+
+    Serial.println("LoRa Receptor configurado em 915 MHz.");
+
+    // 6. Inicializa sensor DHT interno
+    dht.begin();
+    Serial.println("DHT interno inicializado no pino 19.");
+
+    #if USAR_WIFI_MQTT
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    #endif
+
+    atualizarDisplayOLED();
+}
+
+// ---------------------------------------------------------------------------
+// Rotina de Leitura de RFID (Barramento HSPI Independente)
+// ---------------------------------------------------------------------------
+void processarRFID() {
+    // Verifica se existe um novo cartão no leitor RFID
+    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+        return;
+    }
+
+    // --- CÓDIGO EXATO DE cracha-rfid.cpp ---
+    Serial.print("Cartao detectado! UID: ");
+    for (byte i = 0; i < rfid.uid.size; i++) {
+        if (rfid.uid.uidByte[i] < 0x10) {
+            Serial.print("0");
+        }
+        Serial.print(rfid.uid.uidByte[i], HEX);
+        Serial.print(" ");
+    }
+    Serial.println();
+
+    MFRC522::PICC_Type tipo = rfid.PICC_GetType(rfid.uid.sak);
+    Serial.print("Tipo: ");
+    Serial.println(MFRC522Debug::PICC_GetTypeName(tipo));
+
+    // --- CONTROLE DE ENTRADA E SAÍDA DA SALA (cracha-rfid.cpp) ---
+    int pos = -1;
+    for (int i = 0; i < qtdPessoas; i++) {
+        if (tamanhoUidSala[i] == rfid.uid.size) {
+            bool igual = true;
+            for (byte b = 0; b < rfid.uid.size; b++) {
+                if (sala[i][b] != rfid.uid.uidByte[b]) {
+                    igual = false;
+                    break;
+                }
+            }
+            if (igual) {
+                pos = i;
+                break;
+            }
+        }
+    }
+
+    if (pos == -1) {
+        if (qtdPessoas < 20) {
+            tamanhoUidSala[qtdPessoas] = rfid.uid.size;
+            for (byte b = 0; b < rfid.uid.size; b++) {
+                sala[qtdPessoas][b] = rfid.uid.uidByte[b];
+            }
+            qtdPessoas++;
+            Serial.println(">> Status: ENTROU na sala!");
+        }
+    } else {
+        for (int i = pos; i < qtdPessoas - 1; i++) {
+            tamanhoUidSala[i] = tamanhoUidSala[i + 1];
+            for (byte b = 0; b < tamanhoUidSala[i]; b++) {
+                sala[i][b] = sala[i + 1][b];
+            }
+        }
+        qtdPessoas--;
+        Serial.println("<< Status: SAIU da sala!");
+    }
+
+    Serial.print("Total na sala: ");
+    Serial.println(qtdPessoas);
+
+    for (int i = 0; i < qtdPessoas; i++) {
+        Serial.print("  [Pessoa ");
+        Serial.print(i + 1);
+        Serial.print("] UID: ");
+        for (byte b = 0; b < tamanhoUidSala[i]; b++) {
+            if (sala[i][b] < 0x10) {
+                Serial.print("0");
+            }
+            Serial.print(sala[i][b], HEX);
+            Serial.print(" ");
+        }
+        Serial.println();
+    }
+    Serial.println("-------------------------------");
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+
+    atualizarDisplayOLED();
+    #if USAR_WIFI_MQTT
+    publicarMQTT();
+    #endif
+}
+
+// ---------------------------------------------------------------------------
+// LOOP PRINCIPAL
+// ---------------------------------------------------------------------------
+void loop()
+{
+    // 1. Lógica LoRa Receptor (idêntica a comunicacao-lora-receptor.cpp)
+    if(lora_idle)
+    {
+        lora_idle = false;
+        Radio.Rx(0);
+    }
+    Radio.IrqProcess( );
+
+    // 2. Lógica RFID (amostragem periódica a cada 100ms no barramento HSPI separado)
+    if (millis() - ultimaChecagemRFID >= 100) {
+        ultimaChecagemRFID = millis();
+        processarRFID();
+    }
+
+    // 3. Print periódico a cada 3 segundos (de cracha-rfid.cpp)
+    if (millis() - ultimoAviso > 3000) {
+        ultimoAviso = millis();
+        Serial.print("[Sistema rodando] Pessoas dentro da sala agora: ");
+        Serial.println(qtdPessoas);
+        Serial.printf("[Status Climatizacao] Temp Int: %.1f C | Temp Ext: %.1f C | Ar Ideal: %.1f C\n",
+                      tempInterna, tempExterna, calcularTemperaturaIdeal(tempInterna, tempExterna, qtdPessoas));
+        Serial.print("[Diagnostico RFID] ");
+        MFRC522Debug::PCD_DumpVersionToSerial(rfid, Serial);
+        #if USAR_WIFI_MQTT
+        publicarMQTT();
+        #endif
+    }
+
+    // 4. Leitura periódica do sensor DHT interno (a cada 2,5 segundos)
+    if (millis() - ultimaLeituraDHT >= 2500) {
+        ultimaLeituraDHT = millis();
+        sensors_event_t event;
+        dht.temperature().getEvent(&event);
+        if (!isnan(event.temperature)) {
+            tempInterna = event.temperature;
+        }
+        atualizarDisplayOLED();
+    }
+
+    // 5. Atualização visual do Display OLED a cada 1 segundo
+    if (millis() - ultimoUpdateDisplay >= 1000) {
+        ultimoUpdateDisplay = millis();
+        atualizarDisplayOLED();
+    }
+
+    #if USAR_WIFI_MQTT
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!mqttClient.connected()) {
+            if (millis() - ultimaTentativaMQTT > 5000) {
+                ultimaTentativaMQTT = millis();
+                String clientId = "ESP32_Sala_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+                Serial.printf("[MQTT] WiFi OK (IP do ESP32: %s) | Conectando ao broker %s:%d (ID: %s)...\n",
+                              WiFi.localIP().toString().c_str(), MQTT_BROKER, MQTT_PORT, clientId.c_str());
+                if (mqttClient.connect(clientId.c_str())) {
+                    Serial.println("[MQTT] Conectado ao broker com sucesso!");
+                    publicarMQTT();
+                } else {
+                    Serial.printf("[MQTT] Falha na conexao (rc=%d). Tentando novamente em 5s...\n", mqttClient.state());
+                }
+            }
+        } else {
+            mqttClient.loop();
+        }
+    } else if (millis() - ultimaTentativaMQTT > 5000) {
+        ultimaTentativaMQTT = millis();
+        Serial.printf("[WiFi] Aguardando conexao WiFi em \"%s\" (status=%d)...\n", WIFI_SSID, WiFi.status());
+    }
+    #endif
+}
+
+// ---------------------------------------------------------------------------
+// Callback de Recepção LoRa (idêntico a comunicacao-lora-receptor.cpp)
+// ---------------------------------------------------------------------------
+void OnRxDone( uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr )
+{
+    rxSize = size;
+    memcpy(rxpacket, payload, size );
+    rxpacket[size] = '\0';
+    Radio.Sleep( );
+    Serial.printf("\r\nreceived packet \"%s\" with rssi %d , length %d\r\n", rxpacket, rssi, rxSize);
+
+    // Converte a string de temperatura externa recebida para float (suporta "28.20" e "TEMP:28.20;UMID:54.00")
+    float valorRecebido = 0.0;
+    char* ptrTemp = strstr(rxpacket, "TEMP:");
+    if (ptrTemp != NULL) {
+        valorRecebido = atof(ptrTemp + 5);
+    } else {
+        valorRecebido = atof(rxpacket);
+    }
+    if (valorRecebido != 0.0 || strcmp(rxpacket, "0.0") == 0 || strcmp(rxpacket, "0.00") == 0) {
+        tempExterna = valorRecebido;
+        tempExternaRecebida = true;
+        Serial.printf("[LoRa] Temperatura externa atualizada: %.2f *C\n", tempExterna);
+    }
+
+    lora_idle = true;
+    atualizarDisplayOLED();
+}
