@@ -29,16 +29,19 @@
 #include "HT_SSD1306Wire.h"
 
 // Opcional: Se for usar WiFi/MQTT com Node-RED, ative a flag abaixo e coloque seus dados
-#define USAR_WIFI_MQTT                              false
+#define USAR_WIFI_MQTT                              true
 #if USAR_WIFI_MQTT
 #include <WiFi.h>
 #include <PubSubClient.h>
-const char* WIFI_SSID     = "SEU_WIFI_SSID";
-const char* WIFI_PASSWORD = "SUA_WIFI_SENHA";
+// Preencha só na primeira gravação por USB; deixe "" ao gerar o .bin da Release
+// (o .bin é público e conteria a senha). A placa guarda as credenciais na flash.
+const char* WIFI_SSID     = "";
+const char* WIFI_PASSWORD = "";
 const char* MQTT_BROKER   = "broker.hivemq.com";
 const int   MQTT_PORT     = 1883;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
+#include "atualizacao-remota.h" // Atualização remota de firmware (OTA)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -175,6 +178,15 @@ void atualizarDisplayOLED() {
 }
 
 #if USAR_WIFI_MQTT
+void mostrarOTA(const char* texto) {
+    display.clear();
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(0, 0, "=== ATUALIZACAO ===");
+    display.drawStringMaxWidth(0, 20, 128, texto);
+    display.display();
+}
+
 void publicarMQTT() {
     if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
         float arIdeal = calcularTemperaturaIdeal(tempInterna, tempExterna, qtdPessoas);
@@ -262,9 +274,9 @@ void setup() {
     Serial.println("DHT interno inicializado no pino 19.");
 
     #if USAR_WIFI_MQTT
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    otaIniciarWiFi(WIFI_SSID, WIFI_PASSWORD);
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    otaSetup();
     #endif
 
     atualizarDisplayOLED();
@@ -419,6 +431,7 @@ void loop()
                               WiFi.localIP().toString().c_str(), MQTT_BROKER, MQTT_PORT, clientId.c_str());
                 if (mqttClient.connect(clientId.c_str())) {
                     Serial.println("[MQTT] Conectado ao broker com sucesso!");
+                    otaAoConectar();
                     publicarMQTT();
                 } else {
                     Serial.printf("[MQTT] Falha na conexao (rc=%d). Tentando novamente em 5s...\n", mqttClient.state());
@@ -429,7 +442,11 @@ void loop()
         }
     } else if (millis() - ultimaTentativaMQTT > 5000) {
         ultimaTentativaMQTT = millis();
-        Serial.printf("[WiFi] Aguardando conexao WiFi em \"%s\" (status=%d)...\n", WIFI_SSID, WiFi.status());
+        Serial.printf("[WiFi] Aguardando conexao WiFi (status=%d)...\n", WiFi.status());
+    }
+
+    if (otaLoop()) {
+        lora_idle = true; // rearma o receptor LoRa após a pausa da atualização
     }
     #endif
 }

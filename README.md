@@ -34,7 +34,7 @@ Na raiz do repositório encontram-se os códigos completos e integrados de cada 
   - Medição de temperatura/umidade interna com sensor DHT (pino 19);
   - Recepção contínua da temperatura externa transmitida via rádio LoRa (915 MHz);
   - Cálculo inteligente da **temperatura ideal para o ar-condicionado** considerando carga térmica humana, temperatura externa e padrões de ergonomia (NR-17);
-  - Comunicação **MQTT via PubSubClient** (com chave configurável `#define USAR_WIFI_MQTT false` para testes em bancada sem bloqueio) publicando:
+  - Comunicação **MQTT via PubSubClient** (com chave configurável `#define USAR_WIFI_MQTT`; use `false` para testes em bancada sem bloqueio) publicando:
     * `sala/pessoas`: Contagem atual de ocupantes da sala;
     * `sala/temperatura_indicada`: Temperatura recomendada para o ar-condicionado;
     * `sala/temperatura_interna`: Temperatura medida no ambiente interno;
@@ -48,6 +48,23 @@ Na raiz do repositório encontram-se os códigos completos e integrados de cada 
 2. **MFRC522v2** (por *GithubCommunity / miguelbalboa* — instale a versão v2 pelo Gerenciador de Bibliotecas)
 3. **DHT sensor library** (por *Adafruit*) + **Adafruit Unified Sensor**
 4. **PubSubClient** (por *Nick O'Leary*)
+
+### Atualização Remota de Firmware (OTA)
+
+O nó interno se atualiza pela internet a partir das Releases deste repositório ([`atualizacao-remota.h`](./atualizacao-remota.h)). O nó externo não tem Wi-Fi e continua sendo gravado por USB.
+
+**Primeira gravação (USB):** coloque `atualizacao-remota.h` na mesma pasta do sketch, preencha `WIFI_SSID`/`WIFI_PASSWORD`, escolha um *Partition Scheme* com duas partições de aplicação (OTA) e grave. A placa guarda as credenciais.
+
+**Publicar uma versão:**
+
+1. Aumente `FIRMWARE_VERSAO` (ex.: `1.1.0`) e deixe `WIFI_SSID`/`WIFI_PASSWORD` vazios (`""`), pois o `.bin` é público.
+2. No Arduino IDE: *Sketch > Exportar Binário Compilado*. Renomeie o `.ino.bin` (não o `merged` nem o `bootloader`) para `firmware-interno.bin`.
+3. Crie `versao.txt` contendo só `1.1.0`.
+4. Crie a Release com a tag `v1.1.0`, anexe os dois arquivos e marque-a como *latest*.
+
+**Atualizar:** publique `atualizar` em `sala/ota/comando` (sem *retain*), por exemplo com um botão do Node-RED. Acompanhe em `sala/ota/status`.
+
+**Segurança e confiabilidade:** HTTPS com certificado validado e URL fixa; só aceita versão maior; o firmware antigo permanece até o novo ser gravado; a ocupação da sala é preservada; sem MQTT estável em 3 minutos, o bootloader volta à versão anterior (requer bootloader com rollback habilitado).
 
 ### Módulos Separados (Base)
 
