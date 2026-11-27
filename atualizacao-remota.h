@@ -25,7 +25,7 @@
 #include <esp_ota_ops.h>
 
 // Aumente a cada Release (deve ser igual à tag, sem o "v")
-#define FIRMWARE_VERSAO       "1.0.0"
+#define FIRMWARE_VERSAO       "1.0.1"
 #define OTA_URL_BASE          "https://github.com/gpombotky/iot-projeto-final2026.2/releases"
 #define OTA_ARQUIVO           "firmware-interno.bin"
 #define OTA_TOPICO_COMANDO    "sala/ota/comando"
@@ -176,18 +176,25 @@ void otaApagarOcupacao() {
     p.end();
 }
 
+
 void otaRestaurarOcupacao() {
     Preferences p;
     p.begin("ota", false);
+
     int qtd = p.getInt("qtd", 0);
-    if (qtd > 0 && qtd <= 20 &&
+
+    if (qtd >= 0 && qtd <= 20 &&
         p.getBytesLength("sala") == sizeof(sala) &&
         p.getBytesLength("tam") == sizeof(tamanhoUidSala)) {
+
         p.getBytes("sala", sala, sizeof(sala));
         p.getBytes("tam", tamanhoUidSala, sizeof(tamanhoUidSala));
+
         qtdPessoas = qtd;
+
         Serial.printf("[OTA] Ocupacao restaurada: %d pessoa(s)\n", qtd);
     }
+
     p.end();
 }
 
@@ -240,7 +247,9 @@ void otaAoConectar() {
 }
 
 static bool otaLerVersao(const char* texto, int v[3]) {
-    return sscanf(texto, "%d.%d.%d", &v[0], &v[1], &v[2]) == 3;
+    char extra;
+    return sscanf(texto, "%d.%d.%d%c", &v[0], &v[1], &v[2], &extra) == 3
+        && v[0] >= 0 && v[1] >= 0 && v[2] >= 0;
 }
 
 static bool otaVersaoMaior(const int nova[3], const int atual[3]) {
@@ -319,30 +328,52 @@ void otaExecutar() {
 }
 
 // Chamar no loop. Retorna true se tentou atualizar (o rádio deve ser rearmado).
+
 bool otaLoop() {
     if (otaPendente) {
-        if (!mqttClient.connected()) {
-            otaMqttDesde = 0;
-        } else if (otaMqttDesde == 0) {
-            otaMqttDesde = millis();
-        } else if (millis() - otaMqttDesde >= OTA_TEMPO_ESTAVEL_MS) {
-            esp_ota_mark_app_valid_cancel_rollback();
-            otaPendente = false;
-            otaApagarOcupacao();
-            otaStatus("Versao " FIRMWARE_VERSAO " confirmada");
-        }
-        if (otaPendente && millis() >= OTA_TEMPO_LIMITE_MS) {
+
+        // Primeiro verifica se o prazo de inicialização expirou.
+        if (millis() >= OTA_TEMPO_LIMITE_MS) {
             Serial.println("[OTA] Sem MQTT estavel: voltando a versao anterior");
             otaSalvarOcupacao();
             esp_ota_mark_app_invalid_rollback_and_reboot();
+            return false;
+        }
+
+        // Verifica a estabilidade da conexão MQTT.
+        if (!mqttClient.connected()) {
+            otaMqttDesde = 0;
+        }
+        else if (otaMqttDesde == 0) {
+            otaMqttDesde = millis();
+        }
+        else if (millis() - otaMqttDesde >= OTA_TEMPO_ESTAVEL_MS) {
+
+            esp_err_t resultado = esp_ota_mark_app_valid_cancel_rollback();
+
+            if (resultado == ESP_OK) {
+                otaPendente = false;
+                otaApagarOcupacao();
+                otaStatus("Versao " FIRMWARE_VERSAO " confirmada");
+                Serial.println("[OTA] Firmware confirmado com sucesso");
+            }
+            else {
+                Serial.printf("[OTA] Erro ao confirmar firmware: %d\n", (int)resultado);
+                otaStatus("Erro ao confirmar firmware");
+                otaMqttDesde = millis();
+            }
         }
     }
+
     if (!otaSolicitada) return false;
+
     otaSolicitada = false;
+
     if (otaPendente) {
         otaStatus("Aguarde: versao em teste");
         return false;
     }
+
     otaExecutar();
     return true;
 }

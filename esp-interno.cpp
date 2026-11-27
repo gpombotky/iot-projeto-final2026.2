@@ -35,8 +35,8 @@
 #include <PubSubClient.h>
 // Preencha só na primeira gravação por USB; deixe "" ao gerar o .bin da Release
 // (o .bin é público e conteria a senha). A placa guarda as credenciais na flash.
-const char* WIFI_SSID     = "";
-const char* WIFI_PASSWORD = "";
+const char* WIFI_SSID     = "seu wifi";
+const char* WIFI_PASSWORD = "sua senha";
 const char* MQTT_BROKER   = "broker.hivemq.com";
 const int   MQTT_PORT     = 1883;
 WiFiClient espClient;
@@ -456,10 +456,18 @@ void loop()
 // ---------------------------------------------------------------------------
 void OnRxDone( uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr )
 {
+    if (size >= BUFFER_SIZE) {
+        Radio.Sleep();
+        lora_idle = true;
+        Serial.println("[LoRa] Pacote descartado: tamanho excede o buffer.");
+        return;
+    }
+
     rxSize = size;
-    memcpy(rxpacket, payload, size );
+    memcpy(rxpacket, payload, size);
     rxpacket[size] = '\0';
-    Radio.Sleep( );
+
+    Radio.Sleep();
     Serial.printf("\r\nreceived packet \"%s\" with rssi %d , length %d\r\n", rxpacket, rssi, rxSize);
 
     // Converte a string de temperatura externa recebida para float (suporta "28.20" e "TEMP:28.20;UMID:54.00")
